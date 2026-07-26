@@ -53,7 +53,7 @@ Deno.serve(async (req) => {
 
     const { data: payment, error: payErr } = await service
       .from("payments")
-      .select("id, order_id, amount, payment_status, razorpay_order_id, razorpay_payment_id")
+      .select("id, order_id, user_id, amount, payment_status, razorpay_order_id, razorpay_payment_id")
       .eq("id", paymentId)
       .maybeSingle();
 
@@ -136,18 +136,35 @@ Deno.serve(async (req) => {
     }
 
     if (newStatus !== payment.payment_status) {
-      const { error: upErr } = await service.from("payments").update(updateFields).eq("id", payment.id);
-      if (upErr) {
-        console.error("Update failed", upErr);
-        return respondWithError(new PaymentError(ErrorCategory.INTERNAL_ERROR, ERROR_CODES.INTERNAL_ERROR, "Update failed", false), { ...corsHeaders, "Content-Type": "application/json" });
-      }
       if (newStatus === "success") {
-        await service.from("orders").update({
-          payment_status: "completed",
-          order_status: "confirmed",
-        }).eq("id", payment.order_id);
-      } else if (newStatus === "failed") {
-        await service.from("orders").update({ payment_status: "failed" }).eq("id", payment.order_id);
+        const { data: confirmResult, error: confirmError } = await service.rpc("create_payment_confirm", {
+          p_payment_id: payment.id,
+          p_order_id: payment.order_id,
+          p_customer_id: payment.user_id,
+          p_razorpay_payment_id: captured.id,
+          p_razorpay_signature: null,
+          p_is_admin: true,
+          p_transaction_id: captured.id,
+        });
+
+        if (confirmError) {
+          console.error("create_payment_confirm failed", confirmError);
+          return respondWithError(new PaymentError(ErrorCategory.INTERNAL_ERROR, ERROR_CODES.INTERNAL_ERROR, "Confirmation failed", false), { ...corsHeaders, "Content-Type": "application/json" });
+        }
+
+        if (!confirmResult || typeof confirmResult !== 'object' || Array.isArray(confirmResult) || typeof confirmResult.success !== 'boolean') {
+          console.error("RPC contract violation: Malformed payload");
+          return respondWithError(new PaymentError(ErrorCategory.INTERNAL_ERROR, ERROR_CODES.INTERNAL_ERROR, "Internal server error", false), { ...corsHeaders, "Content-Type": "application/json" });
+        }
+      } else {
+        const { error: upErr } = await service.from("payments").update(updateFields).eq("id", payment.id);
+        if (upErr) {
+          console.error("Update failed", upErr);
+          return respondWithError(new PaymentError(ErrorCategory.INTERNAL_ERROR, ERROR_CODES.INTERNAL_ERROR, "Update failed", false), { ...corsHeaders, "Content-Type": "application/json" });
+        }
+        if (newStatus === "failed") {
+          await service.from("orders").update({ payment_status: "failed" }).eq("id", payment.order_id);
+        }
       }
     }
 
