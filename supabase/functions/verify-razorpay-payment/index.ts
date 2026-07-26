@@ -173,7 +173,8 @@ Deno.serve(async (req) => {
       p_order_id: paymentRow.order_id,
       p_customer_id: user.id,
       p_razorpay_payment_id: razorpayPaymentId,
-      p_razorpay_signature: razorpaySignature
+      p_razorpay_signature: razorpaySignature,
+      p_transaction_id: razorpayPaymentId
     });
 
     if (confirmError) {
@@ -189,11 +190,23 @@ Deno.serve(async (req) => {
     if (confirmResult.success !== true) {
       console.error("RPC logical failure:", confirmResult.errorCode);
       let mappedCategory = ErrorCategory.INTERNAL_ERROR;
-      if (confirmResult.errorCode === 'FORBIDDEN') mappedCategory = ErrorCategory.AUTHORIZATION;
-      else if (confirmResult.errorCode === 'NOT_FOUND') mappedCategory = ErrorCategory.NOT_FOUND;
-      else if (confirmResult.errorCode === 'CONFLICT' || (typeof confirmResult.errorCode === 'string' && confirmResult.errorCode.startsWith('VALIDATION'))) mappedCategory = ErrorCategory.VALIDATION;
+      let mappedCode = ERROR_CODES.INTERNAL_ERROR;
+
+      if (confirmResult.errorCode === 'FORBIDDEN') {
+        mappedCategory = ErrorCategory.AUTHORIZATION;
+        mappedCode = ERROR_CODES.FORBIDDEN;
+      } else if (confirmResult.errorCode === 'NOT_FOUND') {
+        mappedCategory = ErrorCategory.NOT_FOUND;
+        mappedCode = ERROR_CODES.NOT_FOUND;
+      } else if (confirmResult.errorCode === 'CONFLICT') {
+        mappedCategory = ErrorCategory.VALIDATION;
+        mappedCode = ERROR_CODES.CONFLICT;
+      } else if (typeof confirmResult.errorCode === 'string' && confirmResult.errorCode.startsWith('VALIDATION')) {
+        mappedCategory = ErrorCategory.VALIDATION;
+        mappedCode = ERROR_CODES.VALIDATION_ERROR;
+      }
       
-      return respondWithError(new PaymentError(mappedCategory, ERROR_CODES.INTERNAL_ERROR, "Payment confirmation failed", false), { ...corsHeaders, "Content-Type": "application/json" });
+      return respondWithError(new PaymentError(mappedCategory, mappedCode, "Payment confirmation failed", false), { ...corsHeaders, "Content-Type": "application/json" });
     }
 
     await service.rpc("log_payment_event", {

@@ -327,7 +327,8 @@ Deno.serve(async (req) => {
         p_order_id: paymentRow.order_id,
         p_customer_id: paymentRow.customer_id,
         p_razorpay_payment_id: razorpayPaymentId,
-        p_razorpay_signature: signature
+        p_razorpay_signature: signature,
+        p_transaction_id: razorpayPaymentId
       });
 
       if (confirmError) {

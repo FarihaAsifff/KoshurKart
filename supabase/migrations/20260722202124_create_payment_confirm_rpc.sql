@@ -26,13 +26,17 @@
 -- included per project convention for forward-compatibility with future
 -- signature changes.
 DROP FUNCTION IF EXISTS public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID);
+DROP FUNCTION IF EXISTS public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID, BOOLEAN);
+DROP FUNCTION IF EXISTS public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID, BOOLEAN, TEXT);
 
 CREATE OR REPLACE FUNCTION public.create_payment_confirm(
   p_payment_id           UUID,
   p_order_id             UUID,
-  p_razorpay_payment_id  TEXT,
-  p_razorpay_signature   TEXT,
-  p_customer_id          UUID
+  p_razorpay_payment_id  TEXT DEFAULT NULL,
+  p_razorpay_signature   TEXT DEFAULT NULL,
+  p_customer_id          UUID DEFAULT NULL,
+  p_is_admin             BOOLEAN DEFAULT FALSE,
+  p_transaction_id       TEXT DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -123,31 +127,15 @@ BEGIN
     );
   END IF;
 
-  IF p_razorpay_payment_id IS NULL THEN
-    RETURN jsonb_build_object(
-      'success', false,
-      'data', null,
-      'isIdempotentReplay', false,
-      'errorCode', 'VALIDATION_MISSING_RAZORPAY_PAYMENT_ID'
-    );
-  END IF;
-
-  IF p_razorpay_signature IS NULL THEN
-    RETURN jsonb_build_object(
-      'success', false,
-      'data', null,
-      'isIdempotentReplay', false,
-      'errorCode', 'VALIDATION_MISSING_RAZORPAY_SIGNATURE'
-    );
-  END IF;
-
-  IF p_customer_id IS NULL THEN
-    RETURN jsonb_build_object(
-      'success', false,
-      'data', null,
-      'isIdempotentReplay', false,
-      'errorCode', 'VALIDATION_MISSING_CUSTOMER_ID'
-    );
+  IF NOT p_is_admin THEN
+    IF p_customer_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'data', null,
+        'isIdempotentReplay', false,
+        'errorCode', 'VALIDATION_MISSING_CUSTOMER_ID'
+      );
+    END IF;
   END IF;
 
   SELECT * INTO v_payment_row FROM public.payments WHERE id = p_payment_id;
@@ -160,6 +148,26 @@ BEGIN
     );
   END IF;
 
+  IF v_payment_row.payment_provider = 'razorpay' THEN
+    IF p_razorpay_payment_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'data', null,
+        'isIdempotentReplay', false,
+        'errorCode', 'VALIDATION_MISSING_RAZORPAY_PAYMENT_ID'
+      );
+    END IF;
+
+    IF p_razorpay_signature IS NULL AND NOT p_is_admin THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'data', null,
+        'isIdempotentReplay', false,
+        'errorCode', 'VALIDATION_MISSING_RAZORPAY_SIGNATURE'
+      );
+    END IF;
+  END IF;
+
   SELECT * INTO v_order_row FROM public.orders WHERE id = p_order_id;
   IF NOT FOUND THEN
     RETURN jsonb_build_object(
@@ -170,7 +178,16 @@ BEGIN
     );
   END IF;
 
-  IF v_payment_row.order_id != v_order_row.id OR v_order_row.customer_id != p_customer_id THEN
+  IF v_payment_row.order_id IS DISTINCT FROM v_order_row.id THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'data', null,
+      'isIdempotentReplay', false,
+      'errorCode', 'FORBIDDEN'
+    );
+  END IF;
+
+  IF NOT p_is_admin AND v_order_row.customer_id IS DISTINCT FROM p_customer_id THEN
     RETURN jsonb_build_object(
       'success', false,
       'data', null,
@@ -200,7 +217,7 @@ BEGIN
   -- ==========================================================================
   SELECT EXISTS(
     SELECT 1 FROM public.ledger_entries
-    WHERE order_id = p_order_id AND status = 'confirmed'
+    WHERE order_id = p_order_id AND payment_id = p_payment_id AND status = 'confirmed'
   ) INTO v_ledger_confirmed;
 
   IF (v_payment_row.credited_at IS NOT NULL) AND v_ledger_confirmed THEN
@@ -208,7 +225,7 @@ BEGIN
     
     SELECT operation_key INTO v_operation_key
     FROM public.ledger_entries
-    WHERE order_id = p_order_id AND status = 'confirmed'
+    WHERE order_id = p_order_id AND payment_id = p_payment_id AND status = 'confirmed'
     ORDER BY id ASC
     LIMIT 1;
 
@@ -235,7 +252,7 @@ BEGIN
   IF NOT v_is_idempotent_replay THEN
     SELECT count(*), max(operation_key) INTO v_ledger_pending_count, v_operation_key
     FROM public.ledger_entries
-    WHERE order_id = p_order_id AND status = 'pending';
+    WHERE order_id = p_order_id AND payment_id = p_payment_id AND status = 'pending';
 
     IF v_ledger_pending_count = 0 THEN
       RETURN jsonb_build_object(
@@ -253,34 +270,36 @@ BEGIN
   -- ==========================================================================
   IF NOT v_is_idempotent_replay THEN
     BEGIN
+      -- Mutate state sequentially, validating uniqueness via RETURNING clauses
       UPDATE public.payments 
       SET status = 'confirmed', 
-          razorpay_payment_id = p_razorpay_payment_id, 
-          razorpay_signature = p_razorpay_signature, 
+          razorpay_payment_id = COALESCE(p_razorpay_payment_id, razorpay_payment_id), 
+          razorpay_signature = COALESCE(p_razorpay_signature, razorpay_signature), 
+          transaction_id = COALESCE(p_transaction_id, transaction_id),
           credited_at = v_now 
-      WHERE id = p_payment_id AND status = 'pending';
-      
-      GET DIAGNOSTICS v_payment_rows_updated = ROW_COUNT;
-      IF v_payment_rows_updated = 0 THEN
+      WHERE id = p_payment_id AND status = 'pending'
+      RETURNING 1 INTO v_payment_rows_updated;
+
+      IF v_payment_rows_updated IS NULL THEN
         RAISE EXCEPTION 'state_transition_conflict';
       END IF;
 
       UPDATE public.orders 
       SET status = 'confirmed' 
-      WHERE id = p_order_id AND status = 'pending';
-      
-      GET DIAGNOSTICS v_order_rows_updated = ROW_COUNT;
-      IF v_order_rows_updated = 0 THEN
+      WHERE id = p_order_id AND status = 'pending'
+      RETURNING 1 INTO v_order_rows_updated;
+
+      IF v_order_rows_updated IS NULL THEN
         RAISE EXCEPTION 'state_transition_conflict';
       END IF;
 
       UPDATE public.ledger_entries 
       SET status = 'confirmed', 
           confirmed_at = v_now 
-      WHERE order_id = p_order_id AND status = 'pending';
-      
-      GET DIAGNOSTICS v_ledger_rows_updated = ROW_COUNT;
-      IF v_ledger_rows_updated = 0 THEN
+      WHERE order_id = p_order_id AND payment_id = p_payment_id AND status = 'pending'
+      RETURNING operation_key INTO v_operation_key;
+
+      IF v_operation_key IS NULL THEN
         RAISE EXCEPTION 'state_transition_conflict';
       END IF;
 
@@ -363,14 +382,14 @@ $$;
 -- ============================================================================
 -- Grants
 -- ============================================================================
-REVOKE ALL ON FUNCTION public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID) FROM authenticated;
-GRANT EXECUTE ON FUNCTION public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID) TO service_role;
+REVOKE ALL ON FUNCTION public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID, BOOLEAN, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID, BOOLEAN, TEXT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID, BOOLEAN, TEXT) TO service_role;
 
 -- ============================================================================
 -- Documentation
 -- ============================================================================
-COMMENT ON FUNCTION public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID) IS
+COMMENT ON FUNCTION public.create_payment_confirm(UUID, UUID, TEXT, TEXT, UUID, BOOLEAN, TEXT) IS
 'Phase 3 confirm-step RPC. Finalizes payment/order/ledger status following
 successful Razorpay confirmation. Idempotent via credited_at + ledger_entries.status
 dual guard (first-writer-wins). Enforces atomic state transitions and sanitizes
