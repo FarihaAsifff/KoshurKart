@@ -60,17 +60,61 @@ BEGIN
     -------------------------------------------------------------------------
     -- 1. Authorization
     -------------------------------------------------------------------------
-    -- TODO: Implement Zero-Trust authorization. Verify caller identity.
+    -- SECURITY DEFINER forces us to manually verify the caller's identity.
+    IF auth.uid() IS NULL OR NOT EXISTS (
+        SELECT 1 FROM public.vendors WHERE id = p_vendor_id AND user_id = auth.uid()
+    ) THEN
+        v_response := jsonb_set(v_response, '{errorCode}', '"UNAUTHORIZED"');
+        RETURN v_response;
+    END IF;
 
     -------------------------------------------------------------------------
     -- 2. Validation & Ownership Verification
     -------------------------------------------------------------------------
-    -- TODO: order lookup
-    -- TODO: order_item lookup
-    -- TODO: vendor verification
-    -- TODO: customer verification
-    -- TODO: ownership verification
-    -- TODO: return_status validation
+    -- 1. Fetch the order item
+    SELECT * INTO v_order_item
+    FROM public.order_items
+    WHERE id = p_order_item_id
+    FOR UPDATE;
+
+    IF v_order_item IS NULL THEN
+        v_response := jsonb_set(v_response, '{errorCode}', '"NOT_FOUND"');
+        RETURN v_response;
+    END IF;
+
+    -- 2. Validate return status
+    IF v_order_item.return_status <> 'requested' THEN
+        v_response := jsonb_set(v_response, '{errorCode}', '"VALIDATION_FAILED"');
+        RETURN v_response;
+    END IF;
+
+    -- 3. Fetch the parent order
+    SELECT * INTO v_order
+    FROM public.orders
+    WHERE id = v_order_item.order_id;
+
+    IF v_order IS NULL THEN
+        v_response := jsonb_set(v_response, '{errorCode}', '"NOT_FOUND"');
+        RETURN v_response;
+    END IF;
+
+    -- 4. Vendor verification
+    IF v_order_item.vendor_id <> p_vendor_id THEN
+        v_response := jsonb_set(v_response, '{errorCode}', '"FORBIDDEN"');
+        RETURN v_response;
+    END IF;
+
+    -- 5. Customer verification
+    IF v_order.customer_id <> p_customer_id THEN
+        v_response := jsonb_set(v_response, '{errorCode}', '"FORBIDDEN"');
+        RETURN v_response;
+    END IF;
+
+    -- 6. Preserve data for later sections
+    v_order_item_status := v_order_item.return_status;
+    v_order_item_vendor_id := v_order_item.vendor_id;
+    v_order_customer_id := v_order.customer_id;
+    v_order_payment_id := v_order.payment_id;
 
     -------------------------------------------------------------------------
     -- 3. Commission & Refund Calculation
