@@ -156,6 +156,11 @@ Deno.serve(async (req) => {
           console.error("RPC contract violation: Malformed payload");
           return respondWithError(new PaymentError(ErrorCategory.INTERNAL_ERROR, ERROR_CODES.INTERNAL_ERROR, "Internal server error", false), { ...corsHeaders, "Content-Type": "application/json" });
         }
+
+        if (confirmResult.success !== true) {
+          console.error("Payment confirmation rejected:", confirmResult.error || confirmResult.message || "Unknown error");
+          return respondWithError(new PaymentError(ErrorCategory.INTERNAL_ERROR, ERROR_CODES.INTERNAL_ERROR, "Payment confirmation failed", false), { ...corsHeaders, "Content-Type": "application/json" });
+        }
       } else {
         const { error: upErr } = await service.from("payments").update(updateFields).eq("id", payment.id);
         if (upErr) {

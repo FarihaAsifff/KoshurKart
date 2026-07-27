@@ -63,13 +63,10 @@ BEGIN
     -------------------------------------------------------------------------
     -- 1. Authorization
     -------------------------------------------------------------------------
-    -- SECURITY DEFINER forces us to manually verify the caller's identity.
-    IF auth.uid() IS NULL OR NOT EXISTS (
-        SELECT 1 FROM public.vendors WHERE id = p_vendor_id AND user_id = auth.uid()
-    ) THEN
-        v_response := jsonb_set(v_response, '{errorCode}', '"UNAUTHORIZED"');
-        RETURN v_response;
-    END IF;
+    -- This RPC is service_role-only and is invoked exclusively by trusted 
+    -- Edge Functions. There is no caller-identity resolution step here — 
+    -- service_role execution is itself the authorization boundary.
+    -- Zero-trust applies instead to the *data* in Section 2.
 
     -------------------------------------------------------------------------
     -- 2. Validation & Ownership Verification
@@ -85,8 +82,12 @@ BEGIN
         RETURN v_response;
     END IF;
 
-    -- 2. Validate return status
-    IF v_order_item.return_status <> 'requested' THEN
+    -- 2. Validate return status (Idempotency Guard)
+    -- If the return has already transitioned past 'requested', we treat it as an idempotent replay
+    -- and bypass the remaining financial mutations.
+    IF v_order_item.return_status IN ('reversing', 'approved') THEN
+        v_is_idempotent_replay := true;
+    ELSIF v_order_item.return_status <> 'requested' THEN
         v_response := jsonb_set(v_response, '{errorCode}', '"VALIDATION_FAILED"');
         RETURN v_response;
     END IF;
@@ -122,6 +123,7 @@ BEGIN
     -------------------------------------------------------------------------
     -- 3. Commission & Refund Calculation
     -------------------------------------------------------------------------
+    IF NOT v_is_idempotent_replay THEN
     -- Retrieve the canonical payment record for the validated order
     SELECT * INTO v_payment
     FROM public.payments
@@ -148,7 +150,9 @@ BEGIN
     FROM public.ledger_entries
     WHERE order_item_id = p_order_item_id
       AND type = 'credit'
-      AND status = 'confirmed';
+      AND status = 'confirmed'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1;
 
     IF v_vendor_reversal_paise IS NULL THEN
         v_response := jsonb_set(v_response, '{errorCode}', '"LEDGER_ENTRY_MISSING"');
@@ -161,7 +165,8 @@ BEGIN
     -- Retrieve the vendor's canonical withdrawable balance (which is stored in paise)
     SELECT withdrawable_balance INTO v_vendor_withdrawable_balance
     FROM public.vendors
-    WHERE id = v_order_item_vendor_id;
+    WHERE id = v_order_item_vendor_id
+    FOR UPDATE;
 
     IF v_vendor_withdrawable_balance IS NULL THEN
         v_response := jsonb_set(v_response, '{errorCode}', '"VENDOR_NOT_FOUND"');
@@ -241,10 +246,64 @@ BEGIN
         ) RETURNING * INTO v_escalation;
     END IF;
 
+    END IF; -- END Idempotency Guard
+
     -------------------------------------------------------------------------
     -- 6. Response Construction
     -------------------------------------------------------------------------
-    -- TODO: Construct successful response object.
+    IF v_is_idempotent_replay THEN
+        -- Hydrate replay data based on the current intercepted state
+        IF v_order_item_status = 'reversing' THEN
+            SELECT amount_paise, operation_key INTO v_vendor_reversal_paise, v_operation_key
+            FROM public.ledger_entries
+            WHERE order_item_id = p_order_item_id
+              AND type = 'reversal'
+              AND status IN ('pending', 'confirmed')
+            ORDER BY created_at DESC, id DESC LIMIT 1;
+        ELSIF v_order_item_status = 'approved' THEN
+            SELECT id INTO v_escalation_id
+            FROM public.payment_escalations
+            WHERE ledger_entry_id = (
+                SELECT id FROM public.ledger_entries 
+                WHERE order_item_id = p_order_item_id AND type = 'credit' AND status = 'confirmed' 
+                ORDER BY created_at DESC, id DESC LIMIT 1
+            )
+            ORDER BY created_at DESC LIMIT 1;
+            
+            SELECT amount_paise INTO v_vendor_reversal_paise
+            FROM public.ledger_entries
+            WHERE order_item_id = p_order_item_id
+              AND type = 'credit'
+              AND status = 'confirmed'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1;
+        END IF;
+    ELSE
+        -- Fresh execution: sync the response state with our mutations
+        IF NOT v_requires_escalation THEN
+            v_order_item_status := 'reversing';
+        ELSE
+            v_order_item_status := 'approved';
+            v_escalation_id := v_escalation.id;
+        END IF;
+    END IF;
+
+    -- Build the canonical response data object
+    v_response_data := jsonb_build_object(
+        'orderItemId', p_order_item_id,
+        'paymentId', v_order_payment_id,
+        'status', v_order_item_status,
+        'amountPaise', v_vendor_reversal_paise,
+        'operationKey', v_operation_key,
+        'escalationId', v_escalation_id
+    );
+
+    v_response := jsonb_build_object(
+        'success', true,
+        'data', v_response_data,
+        'isIdempotentReplay', v_is_idempotent_replay,
+        'errorCode', NULL
+    );
 
     RETURN v_response;
 
@@ -252,14 +311,36 @@ BEGIN
     -- 7. Error Handling
     -------------------------------------------------------------------------
 EXCEPTION
-    -- TODO: SERIALIZATION_FAILURE
-    -- TODO: UNIQUE_VIOLATION
-    -- TODO: CHECK_VIOLATION
-    -- TODO: Others
-    WHEN OTHERS THEN
-        -- TODO: Normalize errors. Log SQLSTATE and SQLERRM without leaking to API.
+    -- Normalize transient locking failures into canonical conflicts
+    WHEN serialization_failure OR deadlock_detected THEN
+        RAISE WARNING '[approve_return_intent] Concurrency failure for order_item %: % (SQLSTATE: %)', p_order_item_id, SQLERRM, SQLSTATE;
+        v_response := jsonb_build_object('success', false, 'data', null, 'isIdempotentReplay', false, 'errorCode', 'CONFLICT');
+        RETURN v_response;
         
-        v_response := jsonb_set(v_response, '{errorCode}', '"INTERNAL_ERROR"');
+    -- Normalize unique constraints (e.g. concurrent identical inserts)
+    WHEN unique_violation THEN
+        RAISE WARNING '[approve_return_intent] Unique constraint violation for order_item %: % (SQLSTATE: %)', p_order_item_id, SQLERRM, SQLSTATE;
+        v_response := jsonb_build_object('success', false, 'data', null, 'isIdempotentReplay', false, 'errorCode', 'CONFLICT');
+        RETURN v_response;
+        
+    -- Normalize data integrity failures
+    WHEN check_violation OR foreign_key_violation THEN
+        RAISE WARNING '[approve_return_intent] Data integrity violation for order_item %: % (SQLSTATE: %)', p_order_item_id, SQLERRM, SQLSTATE;
+        v_response := jsonb_build_object('success', false, 'data', null, 'isIdempotentReplay', false, 'errorCode', 'VALIDATION_FAILED');
+        RETURN v_response;
+
+    -- Catch-all for unexpected database failures
+    WHEN OTHERS THEN
+        -- Safely trap our manually raised optimistic lock conflicts
+        IF SQLERRM = 'state_transition_conflict' THEN
+            v_response := jsonb_build_object('success', false, 'data', null, 'isIdempotentReplay', false, 'errorCode', 'CONFLICT');
+            RETURN v_response;
+        END IF;
+
+        -- For completely unknown failures, suppress postgres internals from the API client 
+        -- but preserve them in standard output/logs for operators.
+        RAISE WARNING '[approve_return_intent] Transaction failed for order_item %: % (SQLSTATE: %)', p_order_item_id, SQLERRM, SQLSTATE;
+        v_response := jsonb_build_object('success', false, 'data', null, 'isIdempotentReplay', false, 'errorCode', 'INTERNAL_ERROR');
         RETURN v_response;
 END;
 $$;
